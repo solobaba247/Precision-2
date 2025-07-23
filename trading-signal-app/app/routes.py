@@ -1,16 +1,32 @@
 # app/routes.py
 
-from flask import current_app, render_template, request, jsonify
-import pandas as pd
+from flask import current_app, request, jsonify
+from functools import wraps
 import concurrent.futures
+import os
 from .ml_logic import get_model_prediction, fetch_fmp_data
-from .helpers import calculate_stop_loss_value, get_latest_price, get_technical_indicators
+from .helpers import calculate_stop_loss_value
+
+# --- MODIFIED: API Key Authentication from URL Parameter ---
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        secret_key = os.getenv("SECRET_API_KEY")
+        if not secret_key:
+            return jsonify({"error": "API service is not configured."}), 500
+        
+        # CHANGED: Get the API key from the URL query parameter `?apikey=`
+        api_key = request.args.get('apikey')
+        
+        if not api_key or api_key != secret_key:
+            return jsonify({"error": "Unauthorized. Invalid or missing API Key in URL."}), 401
+        
+        return f(*args, **kwargs)
+    return decorated_function
+
+# --- The rest of the file remains the same ---
 
 def _get_and_format_signal(symbol, timeframe):
-    """
-    Internal helper to fetch data, generate a prediction, and format the full response.
-    This consolidates logic for both single asset and market scan routes.
-    """
     try:
         data = fetch_fmp_data(symbol, period='90d', interval=timeframe)
         if data is None or len(data) < 50:
@@ -41,7 +57,7 @@ def _get_and_format_signal(symbol, timeframe):
             entry_price = latest_price
             stop_loss = latest_price + (atr_multiplier_sl * latest_atr)
             exit_price = latest_price - (atr_multiplier_tp * latest_atr)
-        else:  # HOLD
+        else:
             entry_price, stop_loss, exit_price = latest_price, latest_price, latest_price
 
         return {
@@ -58,33 +74,23 @@ def _get_and_format_signal(symbol, timeframe):
         print(f"Error in _get_and_format_signal for {symbol}: {e}")
         return {"error": f"Failed to generate signal for {symbol}: {str(e)}"}
 
-
 @current_app.route('/')
-def index():
-    """Main page route with template variables."""
-    return render_template('index.html',
-                         asset_classes=current_app.config.get('ASSET_CLASSES', {}),
-                         timeframes=current_app.config.get('TIMEFRAMES', {}))
+def root():
+    return jsonify({
+        "status": "online",
+        "message": "Welcome to the Trading Signal API. Use the /v1 endpoints with an 'apikey' parameter to access signals.",
+        "model_status": "loaded" if current_app.config.get('MODELS_LOADED', False) else "error"
+    })
 
-@current_app.route('/api/check_model_status')
-def check_model_status():
-    """Health check endpoint for model loading status."""
-    if current_app.config.get('MODELS_LOADED', False):
-        return jsonify({"status": "ok", "models_loaded": True, "message": "Models are loaded and ready."}), 200
-    else:
-        return jsonify({"status": "error", "models_loaded": False, "message": "Models failed to load."}), 503
-
-@current_app.route('/api/generate_signal')
+@current_app.route('/v1/signal')
+@require_api_key
 def generate_signal_route():
-    """Generate trading signal for a single asset."""
     symbol = request.args.get('symbol')
     timeframe = request.args.get('timeframe', '1h')
 
     if not symbol:
         return jsonify({"error": "Symbol parameter is required."}), 400
-    if not current_app.config.get('MODELS_LOADED', False):
-        return jsonify({"error": "Models are not loaded."}), 503
-
+    
     response = _get_and_format_signal(symbol, timeframe)
     
     if "error" in response:
@@ -92,30 +98,27 @@ def generate_signal_route():
     
     return jsonify(response)
 
+
 def get_prediction_for_symbol_sync(symbol, timeframe):
-    """Synchronous wrapper for concurrent execution that filters for actionable signals."""
     result = _get_and_format_signal(symbol, timeframe)
-    
     if result and "error" not in result and result.get("signal") in ["BUY", "SELL"]:
         return result
     return None
 
-@current_app.route('/api/scan_market', methods=['POST'])
+@current_app.route('/v1/scan', methods=['POST'])
+@require_api_key
 def scan_market_route():
-    """Scan multiple assets concurrently for trading signals."""
     try:
         data = request.get_json()
-        asset_type = data.get('asset_type')
+        if not data or 'symbols' not in data:
+            return jsonify({"error": "Request body must be JSON and contain a 'symbols' list."}), 400
+
+        symbols_to_scan = data.get('symbols')
         timeframe = data.get('timeframe', '1h')
         
-        asset_classes = current_app.config.get('ASSET_CLASSES', {})
-        if not asset_type or asset_type not in asset_classes:
-            return jsonify({"error": "Invalid asset type"}), 400
-        
-        if not current_app.config.get('MODELS_LOADED', False):
-            return jsonify({"error": "Models are not loaded."}), 503
-        
-        symbols_to_scan = asset_classes[asset_type]
+        if not isinstance(symbols_to_scan, list):
+            return jsonify({"error": "'symbols' must be a list of asset tickers."}), 400
+            
         results = []
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
@@ -138,12 +141,3 @@ def scan_market_route():
         return jsonify(results)
     except Exception as e:
         return jsonify({"error": f"Failed to scan market: {str(e)}"}), 500
-
-@current_app.route('/api/latest_price')
-def latest_price_route():
-    return get_latest_price(request.args.get('symbol'))
-
-@current_app.route('/api/technical_indicators')
-def technical_indicators_route():
-    symbol, timeframe = request.args.get('symbol'), request.args.get('timeframe', '1h')
-    return get_technical_indicators(symbol, timeframe)
