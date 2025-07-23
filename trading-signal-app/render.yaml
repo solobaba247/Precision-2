@@ -1,14 +1,17 @@
+# render.yaml (NO CHANGES NEEDED)
 services:
   - type: web
-    name: trading-signal-app
+    name: trading-signal-api
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 2 -k gevent run:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.18
-      - key: FMP_API_KEY
+      - key: FMP_API_KEY # For FMP data
         value: 3V5meXmuiupLM1fyL4vs6GeDB7RFA0LM
+      - key: SECRET_API_KEY # For your users
+        value: my-super-secret-key-for-other-apps
       - key: WEB_CONCURRENCY
         value: 2
     plan: free
